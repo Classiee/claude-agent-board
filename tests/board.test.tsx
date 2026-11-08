@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { boardSvg, familyOf } from '../hooks/board-svg'
+import { COMMIT_RE } from '../hooks/register'
 
 const PANE = {
   plugin: 'agent-board',
@@ -147,4 +148,28 @@ test('a working subagent shows motion, not a ticking count', () => {
   expect(done).toContain('>12</text>')
   expect(done).toContain('>tools</text>')
   expect(done.includes('working…')).toBe(false)
+})
+
+test('only a real git commit counts as a commit', () => {
+  for (const yes of ['git commit -m x', 'cd repo && git commit -m x', 'git -C "C:/a b" commit', 'git -c user.name=x commit', 'git commit']) {
+    expect(COMMIT_RE.test(yes)).toBe(true)
+  }
+  for (const no of ['git log --grep commit', 'git commit-tree abc', 'git show -- commit.txt', 'git status']) {
+    expect(COMMIT_RE.test(no)).toBe(false)
+  }
+})
+
+test('a skeptic grepping for a verdict does not set one', async ($, on) => {
+  on('clock.now', () => ({ value: 1_000 }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 's1' }))
+  on('tool.call', () => ({ result: 'no matches' }))
+  await $.agent.spawn({
+    prompt: 'review', subagentType: 'skeptic', description: 'review diff', tool_use_id: 't1',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await $.tool.call({ tool: 'Bash', command: 'grep -r "VERDICT: APPROVED" .', agentId: 's1' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const src = await svgSource(ui)
+  expect(src.includes('VERDICT APPROVED')).toBe(false)
+  await ui.unmount()
 })

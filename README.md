@@ -6,6 +6,9 @@ skeptic's commit-gate verdict, and a session log. It draws as an animated
 diagram in the desktop app, VS Code and mobile, and as a text tree in the
 terminal. Open it with `/agent-board`.
 
+To have it open by itself when a session starts, turn on the plugin's
+"Open on session start" option.
+
 ## Install
 
 At the prompt of a terminal session:

@@ -27,7 +27,9 @@ const board = atom({ plugin: 'agent-board', key: 'board' } as const, EMPTY, {
 })
 
 const VERDICT_RE = /VERDICT\s*:\s*[*_`]*\s*(APPROVED|REJECTED)\b/gi
-const COMMIT_RE = /\bgit(?:\.exe)?\b[^|;&]*?\scommit\b/
+// `git [global options] commit`, with commit as the subcommand itself:
+// not `git log --grep commit`, `git commit-tree` or a file named commit.txt.
+export const COMMIT_RE = /\bgit(?:\.exe)?(?:\s+(?:-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|--?[\w-]+(?:=\S+)?))*\s+commit(?=\s|$|[;&|)])/
 
 /** claude-haiku-5-5 -> "haiku 5.5"; aliases pass through. */
 export function shortModel(model: string | undefined): string {
@@ -69,11 +71,17 @@ function takeChecked(): number {
   return n
 }
 
+// Skeptics whose verdict is already on the board, so a hand-back and the
+// end of the same turn don't log it twice.
+const verdictSeen = new Set<string>()
+
 function patchAgent(b: Board, id: string, fn: (a: AgentCard) => AgentCard): Board {
   return { ...b, agents: b.agents.map(a => (a.id === id ? fn(a) : a)) }
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const openOnStart = options.openOnStart === true
+
   on('session.start', async ($, e, next) => {
     const now = await $.clock.now()
     await update($, board, b => (b.startedAt ? b : addLog({ ...b, startedAt: now }, now, 'session', 'session start', 'info')))
@@ -81,7 +89,7 @@ export const register: Register = on => {
       name: 'agent-board',
       description: 'Open the agent board: main session, advisor, subagents, commit gate',
     })
-    void $.ui.open({ id: PANE, title: TITLE })
+    if (openOnStart) void $.ui.open({ id: PANE, title: TITLE })
 
     return next(e)
   })
@@ -143,7 +151,7 @@ export const register: Register = on => {
       let nb = patchAgent(b, id, a => ({ ...a, status: failed ? 'failed' : 'done', endedAt: now, tools: a.tools + tools }))
       nb = { ...nb, shell: { ...nb.shell, checked: nb.shell.checked + checked } }
       nb = addLog(nb, now, card.type, failed ? `stopped (${e.reason})` : `done in ${clock(now - card.startedAt)}`, failed ? 'bad' : 'ok')
-      if (verdict && card.type === 'skeptic') {
+      if (verdict && card.type === 'skeptic' && !verdictSeen.has(id)) {
         nb = { ...nb, verdict: { status: verdict, at: now } }
         nb = addLog(nb, now, 'skeptic', `VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad')
       }
@@ -180,13 +188,17 @@ export const register: Register = on => {
     const res = await next(e)
     const now = await $.clock.now()
 
-    // A skeptic that hands its report back through a tool call carries its verdict there.
-    if (agentId !== undefined) {
+    // A skeptic that hands its report back through a tool call carries its
+    // verdict there. Only that call counts: a grep or an edit that merely
+    // contains the words is not a verdict.
+    // (the hand-back tool is not in the typed tool list, so compare as a string)
+    if (agentId !== undefined && (e.tool as string) === 'SubagentHandback') {
       const verdict = lastVerdict(JSON.stringify(e))
       if (verdict) {
         await update($, board, b => {
           const card = b.agents.find(a => a.id === agentId)
           if (!card || card.type !== 'skeptic') return b
+          verdictSeen.add(agentId)
           const nb: Board = { ...b, verdict: { status: verdict, at: now } }
           return addLog(nb, now, 'skeptic', `VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad')
         })

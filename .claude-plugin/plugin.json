@@ -1,6 +1,14 @@
 {
   "name": "agent-board",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live side panel of the roles at work: Sonnet main session, Opus advisor, subagents, the skeptic gate and a session log",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openOnStart": {
+      "type": "boolean",
+      "title": "Open on session start",
+      "description": "Open the agent board by itself when a session starts. Off: open it with /agent-board.",
+      "default": false
+    }
+  }
 }
