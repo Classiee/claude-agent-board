@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { boardSvg, familyOf } from '../hooks/board-svg'
-import { COMMIT_RE } from '../hooks/register'
+import { isCommitCommand } from '../hooks/register'
 
 const PANE = {
   plugin: 'agent-board',
@@ -150,12 +150,110 @@ test('a working subagent shows motion, not a ticking count', () => {
   expect(done.includes('working…')).toBe(false)
 })
 
+// The v0.2.0 pattern: whatever real commit it caught, the scanner must catch too.
+const OLD_COMMIT_RE = /\bgit(?:\.exe)?(?:\s+(?:-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|--?[\w-]+(?:=\S+)?))*\s+commit(?=\s|$|[;&|)])/
+
+const REAL_COMMITS = [
+  'git commit -m x',
+  'cd repo && git commit -m x',
+  'cd repo\ngit commit -m x',
+  'git add -A\ngit commit -m x',
+  'git -C "C:/a b" commit',
+  'git -c user.name=x commit',
+  'git -c user.name="A B" commit',
+  'git --no-pager commit',
+  'git --git-dir /x commit',
+  'git --work-tree /x commit',
+  'git commit',
+  'git commit>log.txt',
+  'git commit\\\n  -m x',
+  'git -C "C:/x" `\n  commit -m y',
+  'git `\r\n commit -m y',
+  'bash -c "git commit"',
+  'bash -c "git commit -m x" 2>&1',
+  'bash -c "git commit -m x" arg0',
+  'pwsh -Command "cd x; git commit -m y"',
+  'pwsh -Command { git commit -m x }',
+  'cmd /c git commit',
+  'sudo git commit',
+  'sudo -u bob git commit',
+  'env X=1 git commit',
+  'env -u FOO git commit',
+  'nice -n 10 git commit',
+  'timeout 60 git commit -m x',
+  'GIT_DIR=x git commit',
+  '`git commit`',
+  'if git diff --cached --quiet; then echo none; else git commit -m x; fi',
+  'if [ -n "$(git status --porcelain)" ]; then git commit -m x; fi',
+  'for r in a b; do git -C $r commit -m x; done',
+  '{ git commit -m x; }',
+  '! git commit -m x',
+  'if ($LASTEXITCODE -eq 0) { git commit -m x }',
+  'try { git commit -m x } catch { }',
+  'foreach ($r in $repos) { git -C $r commit -m x }',
+  'git -C a\\ b commit',
+  '& "C:\\Program Files\\Git\\cmd\\git.exe" commit -m x',
+  'C:/tools/git/bin/git.exe commit -m x',
+  'git commit -m "fix: git log output"',
+  'git -C "C:\\repo\\" commit -m x',
+  'git -C "C:\\Users\\krist\\repo\\" commit -m "msg"',
+  'git -C "C:\\\\repo\\\\" commit -m x',
+  'git -C "C:\\repo\\" add -A; git -C "C:\\repo\\" commit -m x',
+  '$r=git commit -m x',
+  '& $git commit -m x',
+  'echo "$(git commit -m x)"',
+  'echo $(git commit -m x)',
+  'Write-Output (git commit -m x)',
+  '<# note #> git commit -m x',
+]
+
+// Not counted. (Some text-only commands, such as `echo git commit`, do count:
+// v0.2.0 counted them too, and a stray "commit allowed" line is the accepted
+// price of never missing a real commit.)
+const NOT_COMMITS = [
+  'git log --grep commit',
+  'git commit-tree abc',
+  'git show -- commit.txt',
+  'git status',
+  'git commit --dry-run',
+  'echo "git commit"',
+  'rg "git commit" README.md',
+  'grep -n \'git commit\' x',
+  'Get-Content log.txt | Select-String "git commit"',
+  'gitk commit',
+]
+
 test('only a real git commit counts as a commit', () => {
-  for (const yes of ['git commit -m x', 'cd repo && git commit -m x', 'git -C "C:/a b" commit', 'git -c user.name=x commit', 'git commit']) {
-    expect(COMMIT_RE.test(yes)).toBe(true)
+  for (const c of REAL_COMMITS) expect([c, isCommitCommand(c)]).toEqual([c, true])
+  for (const c of NOT_COMMITS) expect([c, isCommitCommand(c)]).toEqual([c, false])
+})
+
+test('every real commit the v0.2.0 pattern caught is still caught', () => {
+  for (const c of REAL_COMMITS) {
+    if (OLD_COMMIT_RE.test(c)) expect([c, isCommitCommand(c)]).toEqual([c, true])
   }
-  for (const no of ['git log --grep commit', 'git commit-tree abc', 'git show -- commit.txt', 'git status']) {
-    expect(COMMIT_RE.test(no)).toBe(false)
+})
+
+test('crafted commands are checked fast', () => {
+  const crafted = [
+    'git ' + Array(5000).fill('-C "a"').join(' ') + ' status ' + '--x'.repeat(5000),
+    'git -c ;'.repeat(25000),
+    ';git -C "a'.repeat(10000),
+    ';git -C a'.repeat(10000) + '"',
+    'bash -c "'.repeat(10000),
+    'git '.repeat(50000),
+    '"git commit '.repeat(20000),
+    '{ ( git -C '.repeat(20000),
+    // just under the pattern limit, so the v0.2.0 pattern runs too
+    'git -c ;'.repeat(510),
+    'git ' + Array(580).fill('-C "a"').join(' ') + ' status',
+    ('git ' + '--x '.repeat(20)).repeat(40),
+    'git -C "'.repeat(500),
+  ]
+  for (const c of crafted) {
+    const t0 = Date.now()
+    isCommitCommand(c)
+    expect([c.slice(0, 20), Date.now() - t0 < 200]).toEqual([c.slice(0, 20), true])
   }
 })
 
@@ -171,5 +269,98 @@ test('a skeptic grepping for a verdict does not set one', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const src = await svgSource(ui)
   expect(src.includes('VERDICT APPROVED')).toBe(false)
+  await ui.unmount()
+})
+
+const SKEPTIC = {
+  prompt: 'review', subagentType: 'skeptic', description: 'review diff', tool_use_id: 't1',
+  provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+} as const
+const endTurn = (answer: string) => ({ agentId: 's1', answer, reason: 'end_turn', isAborted: false }) as never
+const handBack = (text: string) => ({ tool: 'SubagentHandback', message: text, agentId: 's1' }) as never
+async function verdictLines(ui: { find: (q: { type: string }) => Promise<{ props: Record<string, unknown> } | undefined> }, v: string) {
+  return ((await svgSource(ui)).match(new RegExp(`VERDICT ${v}`, 'g')) ?? []).length
+}
+
+test('a hand-back and the end of the same turn log the verdict once, in either order', async ($, on) => {
+  on('clock.now', () => ({ value: 1_000 }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 's1' }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('turn.complete', () => ({ text: '' }) as never)
+  await $.agent.spawn(SKEPTIC)
+  await $.tool.call(handBack('x\nVERDICT: REJECTED'))
+  await $.turn.complete(endTurn('x\nVERDICT: REJECTED'))
+  // the other order, for a second run of the same skeptic with the same verdict
+  await $.agent.spawn(SKEPTIC)
+  await $.turn.complete(endTurn('VERDICT: REJECTED'))
+  await $.tool.call(handBack('VERDICT: REJECTED'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await verdictLines(ui, 'REJECTED')).toBe(2) // once per run, never twice in one
+  await ui.unmount()
+})
+
+test('a failed hand-back sets no verdict, and its retry sets one', async ($, on) => {
+  on('clock.now', () => ({ value: 1_000 }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 's1' }))
+  let n = 0
+  on('tool.call', () => (n++ === 0 ? { isError: true, result: undefined, text: 'hand-back failed' } : { result: 'ok' }) as never)
+  await $.agent.spawn(SKEPTIC)
+  await $.tool.call(handBack('VERDICT: APPROVED'))
+  const before = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await verdictLines(before, 'APPROVED')).toBe(0)
+  await before.unmount()
+  await $.tool.call(handBack('VERDICT: APPROVED'))
+  const after = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await verdictLines(after, 'APPROVED')).toBe(1)
+  await after.unmount()
+})
+
+for (const [name, options, opens] of [
+  ['off by default', {}, 0],
+  ['on', { openOnStart: true }, 1],
+  ['off', { openOnStart: false }, 0],
+] as const) {
+  test(`open on session start: ${name}`, { options }, async ($, on) => {
+    let opened = 0
+    on('clock.now', () => ({ value: 1_000 }))
+    on('command.register', () => ({ value: {} }) as never)
+    on('ui.open', () => {
+      opened++
+      return { value: {} } as never
+    })
+    on('session.start', () => ({ cwd: 'C:/x' }) as never)
+    await $.session.start({ cwd: 'C:/x' } as never)
+    expect(opened).toBe(opens)
+  })
+}
+
+test('a denied hand-back sets no verdict', async ($, on) => {
+  on('clock.now', () => ({ value: 1_000 }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 's1' }))
+  on('tool.call', () => ({ deny: 'not allowed' }) as never)
+  await $.agent.spawn(SKEPTIC)
+  await $.tool.call(handBack('VERDICT: APPROVED'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await verdictLines(ui, 'APPROVED')).toBe(0)
+  await ui.unmount()
+})
+
+test('the same verdict from a new run or a new turn is logged again', async ($, on) => {
+  on('clock.now', () => ({ value: 1_000 }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 's1' }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('turn.start', () => ({ turnId: 't2' }) as never)
+  await $.agent.spawn(SKEPTIC)
+  await $.tool.call(handBack('VERDICT: REJECTED'))
+  await $.turn.complete(endTurn('VERDICT: REJECTED'))
+  // resumed under the same id: a new turn, the same verdict
+  await $.turn.start({ text: '', turnId: 't2', agentId: 's1' })
+  await $.tool.call(handBack('VERDICT: REJECTED'))
+  // a new run of the same id, the same verdict again
+  await $.agent.spawn(SKEPTIC)
+  await $.turn.complete(endTurn('VERDICT: REJECTED'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await verdictLines(ui, 'REJECTED')).toBe(3)
   await ui.unmount()
 })

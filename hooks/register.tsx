@@ -3,6 +3,9 @@ import type { Register } from 'claude-code'
 
 import type { AgentCard, Board, LogEntry, LogTone } from '../types'
 import { boardAlt, boardSvg, clock, view } from './board-svg'
+import { isCommitCommand } from './commit-scan'
+
+export { isCommitCommand }
 
 const PANE = 'agent-board'
 const TITLE = 'Agent board'
@@ -27,10 +30,6 @@ const board = atom({ plugin: 'agent-board', key: 'board' } as const, EMPTY, {
 })
 
 const VERDICT_RE = /VERDICT\s*:\s*[*_`]*\s*(APPROVED|REJECTED)\b/gi
-// `git [global options] commit`, with commit as the subcommand itself:
-// not `git log --grep commit`, `git commit-tree` or a file named commit.txt.
-export const COMMIT_RE = /\bgit(?:\.exe)?(?:\s+(?:-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|--?[\w-]+(?:=\S+)?))*\s+commit(?=\s|$|[;&|)])/
-
 /** claude-haiku-5-5 -> "haiku 5.5"; aliases pass through. */
 export function shortModel(model: string | undefined): string {
   if (!model) return '?'
@@ -71,9 +70,10 @@ function takeChecked(): number {
   return n
 }
 
-// Skeptics whose verdict is already on the board, so a hand-back and the
-// end of the same turn don't log it twice.
-const verdictSeen = new Set<string>()
+// The verdict each skeptic put on the board in its current turn. A hand-back
+// and the end of the same turn carry the same verdict, in either order: it is
+// logged once. A new turn or a new run starts afresh.
+const verdictShown = new Map<string, 'APPROVED' | 'REJECTED'>()
 
 function patchAgent(b: Board, id: string, fn: (a: AgentCard) => AgentCard): Board {
   return { ...b, agents: b.agents.map(a => (a.id === id ? fn(a) : a)) }
@@ -102,6 +102,8 @@ export const register: Register = (on, options) => {
 
   // Main loop: thinking / idle, and when its turn began.
   on('turn.start', async ($, e, next) => {
+    // a skeptic's new turn (resumed under its id) is a new review: its verdict is news
+    if (e.agentId !== undefined) verdictShown.delete(e.agentId)
     if (e.agentId === undefined) {
       const now = await $.clock.now()
       await change($, b => ({ ...b, mainStatus: 'thinking', mainTurnAt: now }))
@@ -145,24 +147,36 @@ export const register: Register = (on, options) => {
     const tools = pendingTools.get(id) ?? 0
     pendingTools.delete(id)
     const checked = takeChecked()
+    // Decide and mark in one step (no await between the check and the mark),
+    // so a hand-back finishing meanwhile sees it; undo the mark if the board
+    // write fails, so the verdict isn't lost.
+    const isSkeptic = (await read($, board)).agents.find(a => a.id === id)?.type === 'skeptic'
+    const freshVerdict = verdict !== undefined && isSkeptic && verdictShown.get(id) !== verdict ? verdict : undefined
+    if (freshVerdict) verdictShown.set(id, freshVerdict)
+    try {
     await update($, board, b => {
       const card = b.agents.find(a => a.id === id)
       if (!card) return b
       let nb = patchAgent(b, id, a => ({ ...a, status: failed ? 'failed' : 'done', endedAt: now, tools: a.tools + tools }))
       nb = { ...nb, shell: { ...nb.shell, checked: nb.shell.checked + checked } }
       nb = addLog(nb, now, card.type, failed ? `stopped (${e.reason})` : `done in ${clock(now - card.startedAt)}`, failed ? 'bad' : 'ok')
-      if (verdict && card.type === 'skeptic' && !verdictSeen.has(id)) {
-        nb = { ...nb, verdict: { status: verdict, at: now } }
-        nb = addLog(nb, now, 'skeptic', `VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad')
+      if (freshVerdict) {
+        nb = { ...nb, verdict: { status: freshVerdict, at: now } }
+        nb = addLog(nb, now, 'skeptic', `VERDICT ${freshVerdict}`, freshVerdict === 'APPROVED' ? 'ok' : 'bad')
       }
       return nb
     })
+    } catch (err) {
+      if (freshVerdict && verdictShown.get(id) === freshVerdict) verdictShown.delete(id)
+      throw err
+    }
     return next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
     const res = await next(e)
     if (res.agentId) {
+      verdictShown.delete(res.agentId) // a new run: its verdict is news
       const now = await $.clock.now()
       const card: AgentCard = {
         id: res.agentId,
@@ -192,16 +206,21 @@ export const register: Register = (on, options) => {
     // verdict there. Only that call counts: a grep or an edit that merely
     // contains the words is not a verdict.
     // (the hand-back tool is not in the typed tool list, so compare as a string)
-    if (agentId !== undefined && (e.tool as string) === 'SubagentHandback') {
+    const handedBack = !('isError' in res && res.isError) && !('deny' in res && res.deny)
+    if (agentId !== undefined && (e.tool as string) === 'SubagentHandback' && handedBack) {
       const verdict = lastVerdict(JSON.stringify(e))
-      if (verdict) {
-        await update($, board, b => {
-          const card = b.agents.find(a => a.id === agentId)
-          if (!card || card.type !== 'skeptic') return b
-          verdictSeen.add(agentId)
-          const nb: Board = { ...b, verdict: { status: verdict, at: now } }
-          return addLog(nb, now, 'skeptic', `VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad')
-        })
+      const card = (await read($, board)).agents.find(a => a.id === agentId)
+      if (verdict && card?.type === 'skeptic' && verdictShown.get(agentId) !== verdict) {
+        verdictShown.set(agentId, verdict) // marked before the write; undone if it fails
+        try {
+          await update($, board, b => {
+            const nb: Board = { ...b, verdict: { status: verdict, at: now } }
+            return addLog(nb, now, 'skeptic', `VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad')
+          })
+        } catch (err) {
+          if (verdictShown.get(agentId) === verdict) verdictShown.delete(agentId)
+          throw err
+        }
       }
     }
 
@@ -210,7 +229,7 @@ export const register: Register = (on, options) => {
       const errText = 'isError' in res && res.isError ? res.text ?? '' : 'deny' in res && res.deny ? res.deny : ''
       const hookBlocked = /hook error|hook stopped|blocked/i.test(errText) && /PreToolUse|commit-gate/.test(errText)
       const gateBlocked = errText.includes('[commit-gate]')
-      const isCommit = COMMIT_RE.test(command)
+      const isCommit = isCommitCommand(command)
       pendingChecked++
       const worthDrawing = (hookBlocked && !gateBlocked) || (isCommit && (gateBlocked || !errText))
       if (!worthDrawing) return res
