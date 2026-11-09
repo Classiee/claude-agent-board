@@ -1,7 +1,7 @@
 {
   "name": "agent-board",
-  "version": "0.2.1",
-  "description": "Live side panel of the roles at work: Sonnet main session, Opus advisor, subagents, the skeptic gate and a session log",
+  "version": "0.3.0",
+  "description": "Live side panel for Claude Code: the main session, advisor, subagents, reviewer verdicts, shell calls and a session log. A model is shown as seen answering, or marked as configured when only your settings name it",
   "types": "./types/index.d.ts",
   "userConfig": {
     "openOnStart": {
@@ -9,6 +9,12 @@
       "title": "Open on session start",
       "description": "Open the agent board by itself when a session starts. Off: open it with /agent-board.",
       "default": false
+    },
+    "reviewerAgent": {
+      "type": "string",
+      "title": "Reviewer agent name",
+      "description": "The subagent type whose report ends with a VERDICT: APPROVED or VERDICT: REJECTED line. The board shows that line as the reviewer's verdict.",
+      "default": "skeptic"
     }
   }
 }

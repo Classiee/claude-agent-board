@@ -1,8 +1,13 @@
-import type { AgentCard, Board, LogTone } from '../types'
+import type { AgentCard, Board, LogEntry } from '../types'
+import { modelFamily, modelLabel } from './models'
 
-// A dark terminal-window board: Sonnet main session on top, delegation lines
-// down to subagent cards, the Opus reviewer column on the left, a session log,
-// the prompt and a status line. Animated with SMIL (drawn isInteractive).
+// A dark terminal-window board: the main session on top, delegation lines
+// down to subagent cards, the advisor column on the left, a session log and a
+// status line. Animated with SMIL (drawn isInteractive).
+//
+// Nothing here assumes which models the user runs. Every model name comes from
+// the board's data; a model this does not know is drawn with its own id and a
+// neutral colour, and a model nobody has reported is drawn as "unknown".
 
 const W = 560
 const H = 700
@@ -15,6 +20,7 @@ const C = {
   text: '#e7e7e9',
   dim: '#8b9099',
   faint: '#4a4e56',
+  other: '#a7adb8',
   sonnet: '#e8833a',
   haiku: '#5b8def',
   opus: '#b49cf5',
@@ -27,8 +33,11 @@ export function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-function cut(s: string, n: number): string {
-  return s.length > n ? s.slice(0, Math.max(0, n - 1)) + '…' : s
+export function cut(s: string, n: number): string {
+  if (s.length <= n) return s
+  let head = s.slice(0, Math.max(0, n - 1))
+  if (/[\ud800-\udbff]$/.test(head)) head = head.slice(0, -1) // do not split a surrogate pair
+  return head + '…'
 }
 
 export function clock(ms: number): string {
@@ -36,19 +45,18 @@ export function clock(ms: number): string {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 }
 
-export function modelColor(model: string): string {
-  if (model.includes('haiku')) return C.haiku
-  if (model.includes('opus')) return C.opus
-  if (model.includes('fable')) return C.fable
-  return C.sonnet
+/** A colour per known model family; any other model gets a neutral one. */
+export function familyColor(family: string | undefined): string {
+  if (family === 'haiku') return C.haiku
+  if (family === 'opus') return C.opus
+  if (family === 'fable') return C.fable
+  if (family === 'sonnet') return C.sonnet
+  return C.other
 }
 
-function whoColor(who: string, tone: LogTone): string {
-  if (who === 'gate') return tone === 'bad' ? C.bad : C.ok
-  if (who === 'sonnet') return C.sonnet
-  if (who === 'opus' || who === 'skeptic') return C.opus
-  if (who === 'haiku' || who === 'test-runner' || who === 'Explore') return C.haiku
-  return C.dim
+function logColor(l: LogEntry): string {
+  if (l.who === 'commit') return l.tone === 'bad' ? C.bad : C.ok
+  return l.family ? familyColor(l.family) : C.dim
 }
 
 function t(x: number, y: number, s: string, o: { fill?: string; size?: number; weight?: number; anchor?: string; spacing?: number } = {}): string {
@@ -85,10 +93,10 @@ function dot(x: number, y: number, color: string, pulse: boolean): string {
 export type View = {
   now: number
   mainState: string
-  opusState: 'asleep' | 'advising' | 'reviewing'
-  activeTab: 'sonnet' | 'haiku' | 'opus' | 'none'
-  /** The main session's model family: sonnet, opus, haiku, fable. */
-  mainFamily: string
+  /** The advisor: consulted during the current turn, or not. */
+  advisorState: 'asleep' | 'advising'
+  /** Whether a reviewer subagent is running. That is a subagent, not the advisor. */
+  reviewing: boolean
   running: AgentCard[]
   shown: AgentCard[]
 }
@@ -97,20 +105,61 @@ export function view(b: Board, now: number): View {
   const running = b.agents.filter(a => a.status === 'running')
   const finished = b.agents.filter(a => a.status !== 'running').reverse()
   const shown = [...running, ...finished].slice(0, 3)
-  const skepticRunning = running.some(a => a.type === 'skeptic')
+  const reviewing = running.some(a => a.reviewer)
   const advising = b.advisorLastAt !== undefined && b.advisorLastAt >= b.mainTurnAt && b.mainStatus !== 'idle'
-  const opusState = skepticRunning ? 'reviewing' : advising ? 'advising' : 'asleep'
+  const advisorState = advising ? 'advising' : 'asleep'
   const mainState = running.length > 0 ? 'delegating' : b.mainStatus
-  const mainFamily = familyOf(b.mainModel)
-  const mainTab = mainFamily === 'sonnet' || mainFamily === 'opus' || mainFamily === 'haiku' ? mainFamily : 'none'
-  const activeTab =
-    opusState !== 'asleep' ? 'opus' : running.some(a => a.model.includes('haiku')) ? 'haiku' : mainTab
-  return { now, mainState, opusState, activeTab, mainFamily, running, shown }
+  return { now, mainState, advisorState, reviewing, running, shown }
+}
+
+/** The model labels the board shows, from its data alone. */
+export function names(b: Board) {
+  const main = b.mainModel ? modelLabel(b.mainModel) : 'unknown'
+  const advisor = b.advisorModel ? modelLabel(b.advisorModel) : b.advisorCalls > 0 ? 'model not stated' : 'none found'
+  const shell = b.shellCheck ? (b.shellCheck.model ? modelLabel(b.shellCheck.model) : 'model not stated') : 'none found'
+  const mainNote =
+    !b.mainModel ? 'no model seen yet' : b.mainSource === 'observed' ? 'observed in the last response' : 'configured, not yet observed'
+  // A model that was only asked for (a setting, /model, a step's request) is marked "(cfg)"
+  // wherever it is named, as the advisor and shell check always are: the board never sees those answer.
+  const mainConfigured = b.mainModel !== '' && b.mainSource === 'configured'
+  const mainChip = mainConfigured ? `${cut(main, 12)} (cfg)` : main
+  const backTo = b.mainModel ? cut(main, 22) + (mainConfigured ? ' (cfg)' : '') : 'main session'
+  const advisorChip = b.advisorModel ? `${cut(advisor, 12)} (cfg)` : advisor
+  const shellChip = b.shellCheck?.model ? `${cut(shell, 12)} (cfg)` : shell
+  // the same model, worded for text: the board has only read these from settings
+  const advisorText = b.advisorModel ? `${advisor} (configured)` : advisor
+  const shellText = b.shellCheck?.model ? `${shell} (configured)` : shell
+  return {
+    main,
+    advisor,
+    shell,
+    mainChip,
+    backTo,
+    advisorChip,
+    shellChip,
+    advisorText,
+    shellText,
+    mainNote,
+    mainColor: familyColor(modelFamily(b.mainModel)),
+    advisorColor: familyColor(modelFamily(b.advisorModel)),
+    reviewerColor: familyColor(modelFamily(b.agents.filter(a => a.reviewer).at(-1)?.model)),
+    shellColor: familyColor(modelFamily(b.shellCheck?.model)),
+  }
+}
+
+/**
+ * A subagent's model as drawn; "(cfg)" marks one that was asked for but has not
+ * yet been seen answering. With `max`, the model is cut to fit and the marker stays.
+ */
+export function agentModel(a: AgentCard, max?: number): string {
+  const label = modelLabel(a.model)
+  return (max === undefined ? label : cut(label, max)) + (a.modelSource === 'configured' && a.model ? ' (cfg)' : '')
 }
 
 export function boardSvg(b: Board, now: number): string {
   clockMs = now
   const v = view(b, now)
+  const n = names(b)
   const t0 = b.startedAt || now
   const out: string[] = []
   const add = (s: string) => out.push(s)
@@ -118,63 +167,63 @@ export function boardSvg(b: Board, now: number): string {
   // window + chrome
   add(`<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="10" fill="${C.bg}" stroke="${C.line}"/>`)
   for (const [i, x] of [16, 28, 40].entries()) add(`<circle cx="${x}" cy="14" r="3.5" fill="${['#ff5f57', '#febc2e', '#28c840'][i]}" opacity="0.55"/>`)
-  add(t(W / 2, 18, '~/repo · claude code', { fill: C.dim, size: 10, anchor: 'middle' }))
+  add(t(W / 2, 18, 'claude code · agent board', { fill: C.dim, size: 10, anchor: 'middle' }))
   add(`<line x1="0" y1="28" x2="${W}" y2="28" stroke="${C.line}"/>`)
 
-  // header + model tabs
-  add(t(16, 50, 'CLAUDE CODE · 3 MODELS', { size: 13, weight: 700, spacing: 1.2 }))
-  const tabs: Array<[View['activeTab'], string, string, string]> = [
-    ['sonnet', 'SONNET 5.5', 'builds', C.sonnet],
-    ['haiku', 'HAIKU 5.5', 'checks', C.haiku],
-    ['opus', 'OPUS 5.5', 'reviews', C.opus],
+  // header + role chips: which model is in which role, as far as it is known
+  add(t(16, 50, 'CLAUDE CODE · AGENT BOARD', { size: 13, weight: 700, spacing: 1.2 }))
+  const chips: Array<[string, string, string, boolean]> = [
+    ['MAIN', n.mainChip, n.mainColor, v.mainState !== 'idle'],
+    ['ADVISOR', n.advisorChip, n.advisorColor, v.advisorState === 'advising'],
+    ['SHELL', n.shellChip, n.shellColor, false],
   ]
-  tabs.forEach(([id, name, role, color], i) => {
+  chips.forEach(([role, label, color, on], i) => {
     const x = 16 + i * 178
-    const on = v.activeTab === id
     add(rect(x, 60, 170, 20, on ? color : C.line, on ? '#16192099' : C.panel))
-    add(`<text x="${x + 8}" y="74" font-size="10"><tspan fill="${on ? color : C.text}" font-weight="700">${name}</tspan><tspan fill="${C.dim}"> ${role}</tspan></text>`)
+    add(`<text x="${x + 8}" y="74" font-size="10"><tspan fill="${on ? color : C.text}" font-weight="700">${esc(role)}</tspan><tspan fill="${C.dim}"> ${esc(cut(label, 18))}</tspan></text>`)
   })
 
-  // ── Opus reviewer column ─────────────────────────────────────
+  // ── advisor / reviewer column ────────────────────────────────
   const ox = 16
   const ow = 154
   add(rect(ox, 92, ow, 352))
-  add(t(ox + 12, 112, 'OPUS 5.5', { weight: 700, size: 12 }))
-  add(t(ox + 12, 127, 'reviewer · on call', { fill: C.dim, size: 10 }))
-  add(t(ox + 12, 156, v.opusState, { fill: v.opusState === 'asleep' ? C.faint : C.opus, size: 18, weight: 600 }))
+  add(t(ox + 12, 112, 'ADVISOR', { weight: 700, size: 12 }))
+  add(t(ox + 12, 126, n.advisorChip, { fill: C.dim, size: 10 }))
+  if (b.advisorModel) add(t(ox + 12, 140, 'runtime model unobserved', { fill: C.faint, size: 9 }))
+  add(t(ox + 12, 170, v.advisorState, { fill: v.advisorState === 'asleep' ? C.faint : n.advisorColor, size: 16, weight: 600 }))
 
-  const checkpoints: Array<[string, string, boolean, boolean]> = [
-    ['advisor', 'key decisions', b.advisorCalls > 0, v.opusState === 'advising'],
-    ['skeptic', 'breaks each diff', b.agents.some(a => a.type === 'skeptic'), v.opusState === 'reviewing'],
-    ['gate', 'no verdict, no commit', b.commit !== undefined, false],
+  // each checkpoint has its own colour: the advisor's model, the reviewer subagent's model, neutral
+  const checkpoints: Array<[string, string, boolean, boolean, string]> = [
+    ['advisor', 'consultations', b.advisorCalls > 0, v.advisorState === 'advising', n.advisorColor],
+    ['reviewer', 'reports a verdict', b.agents.some(a => a.reviewer), v.reviewing, n.reviewerColor],
+    ['commits', 'commit calls seen', b.commit !== undefined, false, C.other],
   ]
   add(`<line x1="${ox + 16}" y1="180" x2="${ox + 16}" y2="276" stroke="${C.faint}"/>`)
-  checkpoints.forEach(([name, note, lit, live], i) => {
+  checkpoints.forEach(([name, note, lit, live, color], i) => {
     const y = 180 + i * 48
-    add(`<circle cx="${ox + 16}" cy="${y}" r="5" fill="${lit ? C.opus : C.bg}" stroke="${lit ? C.opus : C.dim}">${live ? `<animate attributeName="r" values="5;7;5" dur="1.2s"${sync(1.2)} repeatCount="indefinite"/>` : ''}</circle>`)
+    add(`<circle cx="${ox + 16}" cy="${y}" r="5" fill="${lit ? color : C.bg}" stroke="${lit ? color : C.dim}">${live ? `<animate attributeName="r" values="5;7;5" dur="1.2s"${sync(1.2)} repeatCount="indefinite"/>` : ''}</circle>`)
     add(t(ox + 28, y + 4, name, { size: 11, weight: 600, fill: lit ? C.text : C.dim }))
     add(t(ox + 28, y + 18, note, { size: 9, fill: C.dim }))
     // reviewer → main session wiring
-    add(path(`M${ox + 100 + i * 8} ${y} H${ox + ow + 6 + i * 5} V${112 + i * 16} H190`, live ? C.opus : C.faint, live))
+    add(path(`M${ox + 100 + i * 8} ${y} H${ox + ow + 6 + i * 5} V${112 + i * 16} H190`, live ? color : C.faint, live))
   })
-  add(`<line x1="${ox + 12}" y1="318" x2="${ox + 12}" y2="334" stroke="${C.dim}"/>`)
-  add(t(ox + 20, 330, 'wakes only when it matters', { size: 9, fill: C.dim }))
   add(`<line x1="${ox}" y1="346" x2="${ox + ow}" y2="346" stroke="${C.line}"/>`)
-  add(t(ox + 12, 364, 'calls', { size: 10, fill: C.dim }))
+  add(t(ox + 12, 364, 'advisor calls', { size: 10, fill: C.dim }))
   add(t(ox + 12, 398, String(b.advisorCalls), { size: 30, weight: 300, fill: b.advisorCalls ? C.text : C.faint }))
-  add(t(ox + 12, 418, 'last verdict', { size: 10, fill: C.dim }))
+  add(t(ox + 12, 418, 'last verdict reported', { size: 10, fill: C.dim }))
   const vColor = !b.verdict ? C.faint : b.verdict.status === 'APPROVED' ? C.ok : C.bad
   add(t(ox + 12, 434, b.verdict ? b.verdict.status.toLowerCase() : '—', { size: 12, weight: 600, fill: vColor }))
 
-  // ── Sonnet main session ──────────────────────────────────────
+  // ── main session ─────────────────────────────────────────────
   const sx = 190
   const sw = 354
   const active = v.mainState !== 'idle'
-  add(rect(sx, 92, sw, 70, active ? '#3a2a1e' : C.line))
-  add(t(sx + 14, 112, `${shortName(b.mainModel || 'claude-sonnet-5-5')} · main session`, { weight: 700, size: 12 }))
-  add(t(sx + 14, 128, 'writes the code', { fill: C.dim, size: 10 }))
-  add(t(sx + 14, 150, `--model ${v.mainFamily} --advisor opus`, { fill: C.dim, size: 10 }))
-  add(t(sx + sw - 14, 152, cut(v.mainState, 16), { fill: active ? modelColor(v.mainFamily) : C.faint, size: 16, weight: 600, anchor: 'end' }))
+  const acc = n.mainColor
+  add(rect(sx, 92, sw, 70, active ? '#2a2a30' : C.line))
+  add(t(sx + 14, 112, `${b.mainModel ? cut(n.main, 30) : 'unknown model'} · main session`, { weight: 700, size: 12 }))
+  add(t(sx + 14, 128, n.mainNote, { fill: C.dim, size: 10 }))
+  add(t(sx + 14, 150, b.mainModel ? cut(b.mainModel, 34) : '', { fill: C.faint, size: 10 }))
+  add(t(sx + sw - 14, 152, cut(v.mainState, 16), { fill: active ? acc : C.faint, size: 16, weight: 600, anchor: 'end' }))
 
   // ── delegation lines + subagent cards ────────────────────────
   const cw = 112
@@ -183,10 +232,10 @@ export function boardSvg(b: Board, now: number): string {
   const cx = (i: number) => sx + i * (cw + gap)
   const mid = (i: number) => cx(i) + cw / 2
   const anyRunning = v.running.length > 0
-  const trunk = anyRunning ? C.sonnet : C.faint
-  const firstModel = v.running[0]?.model ?? v.shown[0]?.model
+  const trunk = anyRunning ? acc : C.faint
+  const first = v.running[0] ?? v.shown[0]
   add(path(`M${sx + sw / 2} 162 V190`, trunk, anyRunning))
-  add(t(sx + sw / 2 + 8, 182, firstModel ? `delegate → ${firstModel}` : 'delegate → subagents', { size: 10, fill: anyRunning ? C.text : C.dim }))
+  add(t(sx + sw / 2 + 8, 182, first ? `delegate → ${agentModel(first, first.modelSource === 'configured' ? 10 : 16)}` : 'delegate → subagents', { size: 10, fill: anyRunning ? C.text : C.dim }))
   const slots = Math.max(1, v.shown.length)
   if (slots > 1) add(path(`M${mid(0)} 190 H${mid(slots - 1)}`, trunk, anyRunning))
 
@@ -199,13 +248,13 @@ export function boardSvg(b: Board, now: number): string {
   v.shown.forEach((a, i) => {
     const x = cx(i)
     const run = a.status === 'running'
-    const mc = modelColor(a.model)
-    const sc = run ? C.sonnet : a.status === 'done' ? C.ok : C.bad
-    add(path(`M${mid(i)} 190 V${cy}`, run ? C.sonnet : C.faint, run))
-    add(dot(mid(i), 190, run ? C.sonnet : C.faint, run))
+    const mc = familyColor(modelFamily(a.model))
+    const sc = run ? acc : a.status === 'done' ? C.ok : C.bad
+    add(path(`M${mid(i)} 190 V${cy}`, run ? acc : C.faint, run))
+    add(dot(mid(i), 190, run ? acc : C.faint, run))
     add(rect(x, cy, cw, 92, run ? mc : C.line))
-    add(t(x + 10, cy + 18, cut(a.type, 13), { weight: 700, size: 12 }))
-    add(t(x + 10, cy + 32, a.model, { fill: mc, size: 10 }))
+    add(t(x + 10, cy + 18, cut(a.type || 'agent', 13), { weight: 700, size: 12 }))
+    add(t(x + 10, cy + 32, agentModel(a, 10), { fill: mc, size: 10 }))
     add(t(x + 10, cy + 46, cut(a.task, 17), { fill: C.dim, size: 9 }))
     // bar: indeterminate sweep while running, full when finished
     add(`<rect x="${x + 10}" y="${cy + 54}" width="${cw - 20}" height="4" rx="2" fill="${C.line}"/>`)
@@ -216,7 +265,7 @@ export function boardSvg(b: Board, now: number): string {
     }
     // the count is written when the agent finishes; while it runs, the motion is the signal
     if (run) {
-      add(t(x + 10, cy + 80, 'working…', { size: 11, fill: C.dim }))
+      add(t(x + 10, cy + 80, 'working…', { size: 10, fill: C.dim }))
     } else {
       add(t(x + 10, cy + 82, String(a.tools), { size: 18, weight: 300 }))
       add(t(x + 10 + String(a.tools).length * 11 + 4, cy + 82, 'tools', { size: 9, fill: C.dim }))
@@ -229,18 +278,20 @@ export function boardSvg(b: Board, now: number): string {
   const extra = v.running.length - v.shown.filter(a => a.status === 'running').length
   if (extra > 0) add(t(sx + sw, cy - 4, `+${extra} more running`, { size: 9, fill: C.dim, anchor: 'end' }))
 
-  // back to sonnet
+  // back to the main session
   const last = b.agents.filter(a => a.status !== 'running').at(-1)
   add(rect(sx, 332, sw, 48))
-  add(t(sx + 14, 351, `back to ${shortName(b.mainModel || 'claude-sonnet-5-5').toLowerCase()}`, { weight: 700, size: 12 }))
+  add(t(sx + 14, 351, `back to ${n.backTo}`, { weight: 700, size: 12 }))
   add(t(sx + 14, 368, last ? cut(`${last.type} ${last.status} in ${clock((last.endedAt ?? now) - last.startedAt)}`, 34) : 'results land here', { size: 10, fill: C.dim }))
-  add(t(sx + sw - 14, 360, anyRunning ? 'waiting' : last ? 'received' : '—', { size: 11, fill: anyRunning ? C.sonnet : C.dim, anchor: 'end' }))
+  add(t(sx + sw - 14, 360, anyRunning ? 'waiting' : last ? 'received' : '—', { size: 11, fill: anyRunning ? acc : C.dim, anchor: 'end' }))
 
-  // haiku shell check
+  // shell calls: how many the board saw, and whether a model-backed check is configured
   add(rect(sx, 392, sw, 52))
-  add(t(sx + 14, 411, 'HAIKU 5.5 · shell check', { weight: 700, size: 11, fill: C.haiku }))
-  add(t(sx + 14, 430, `${b.shell.checked} checked · ${b.shell.blocked} blocked`, { size: 11, fill: C.text }))
-  add(t(sx + sw - 14, 430, 'every bash call', { size: 9, fill: C.dim, anchor: 'end' }))
+  // The refusal count is every PreToolUse refusal, whichever hook made it: it is drawn on its
+  // own line, apart from the configured model check named below it.
+  add(t(sx + 14, 411, cut(`SHELL CALLS · ${b.shell.seen} seen · ${b.shell.blocked} blocked by a hook`, 50), { weight: 700, size: 11 }))
+  const checkLine = b.shellCheck ? `model check: ${cut(n.shell, 16)}${b.shellCheck.model ? ' (configured)' : ''}` : 'no model check found'
+  add(t(sx + 14, 430, checkLine, { size: 11, fill: b.shellCheck ? n.shellColor : C.dim }))
 
   // session log
   add(rect(16, 458, W - 32, 152))
@@ -251,43 +302,38 @@ export function boardSvg(b: Board, now: number): string {
     const y = 497 + i * 18
     const newest = i === rows.length - 1
     add(t(28, y, clock(l.at - t0), { size: newest ? 11 : 10, fill: newest ? C.text : C.dim, weight: newest ? 600 : 400 }))
-    add(t(84, y, cut(l.who, 11), { size: 10, fill: whoColor(l.who, l.tone) }))
+    add(t(84, y, cut(l.who, 11), { size: 10, fill: logColor(l) }))
     const tc = l.tone === 'bad' ? C.bad : newest ? C.text : C.dim
     add(t(176, y, cut(l.text, 50), { size: newest ? 11 : 10, fill: tc, weight: newest ? 600 : 400 }))
   })
 
   // prompt + status line
-  const prompt = ` claude --model ${v.mainFamily} --advisor opus`
-  add(`<text x="16" y="640" font-size="12"><tspan fill="${C.sonnet}">&gt;</tspan><tspan fill="${C.text}">${esc(prompt)}</tspan></text>`)
+  const prompt = ' /agent-board'
+  add(`<text x="16" y="640" font-size="12"><tspan fill="${acc}">&gt;</tspan><tspan fill="${C.text}">${esc(prompt)}</tspan></text>`)
   add(`<rect x="${Math.round(16 + 7.05 * (prompt.length + 1) + 8)}" y="630" width="7" height="13" fill="${C.text}"><animate attributeName="opacity" values="1;1;0;0" dur="1.1s"${sync(1.1)} repeatCount="indefinite"/></rect>`)
   add(`<line x1="0" y1="660" x2="${W}" y2="660" stroke="${C.line}"/>`)
-  const gate = b.verdict ? b.verdict.status.toLowerCase() : '—'
+  const verdict = b.verdict ? b.verdict.status.toLowerCase() : '—'
+  // two rows: one row would run past the board once the review and verdict segments are in
   add(
-    `<text x="16" y="684" font-size="10">` +
-      `<tspan fill="${C.haiku}">subagents</tspan><tspan fill="${C.text}"> [${v.running.length}/${b.agents.length}]</tspan>` +
-      `<tspan fill="${C.dim}">  ·  </tspan><tspan fill="${C.opus}">opus</tspan><tspan fill="${C.text}"> [${v.opusState}]</tspan>` +
-      `<tspan fill="${C.dim}">  ·  </tspan><tspan fill="${C.text}">shell [${b.shell.checked}/${b.shell.blocked}✗]</tspan>` +
-      `<tspan fill="${C.dim}">  ·  </tspan><tspan fill="${C.text}">gate [${esc(gate)}]</tspan>` +
+    `<text x="16" y="676" font-size="10">` +
+      `<tspan fill="${acc}">subagents</tspan><tspan fill="${C.text}"> [${v.running.length}/${b.agents.length}]</tspan>` +
+      `<tspan fill="${C.dim}">  ·  </tspan><tspan fill="${n.advisorColor}">advisor</tspan><tspan fill="${C.text}"> [${v.advisorState}]</tspan>` +
+      `<tspan fill="${C.dim}">  ·  </tspan><tspan fill="${n.reviewerColor}">review</tspan><tspan fill="${C.text}"> [${v.reviewing ? 'reviewing' : 'idle'}]</tspan>` +
+      `</text>`,
+  )
+  add(
+    `<text x="16" y="691" font-size="10">` +
+      `<tspan fill="${C.text}">shell [${b.shell.seen}/${b.shell.blocked}✗]</tspan>` +
+      `<tspan fill="${C.dim}">  ·  </tspan><tspan fill="${C.text}">reported [${esc(verdict)}]</tspan>` +
       `</text>`,
   )
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="${FONT}">${out.join('')}</svg>`
 }
 
-/** claude-opus-5-5 / opus 5.5 -> "opus"; unknown -> "sonnet" (the configured default). */
-export function familyOf(model: string): string {
-  const m = /(sonnet|opus|haiku|fable)/i.exec(model)
-  return m?.[1] ? m[1].toLowerCase() : 'sonnet'
-}
-
-function shortName(model: string): string {
-  const m = /claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(model)
-  if (!m) return model.toUpperCase()
-  return `${(m[1] ?? '').toUpperCase()} ${m[2]}${m[3] ? '.' + m[3] : ''}`
-}
-
 export function boardAlt(b: Board, now: number): string {
   const v = view(b, now)
-  const agents = v.shown.map(a => `${a.type} (${a.model}) ${a.status}`).join(', ') || 'no subagents'
-  return `Agent board: main session ${v.mainState}; Opus ${v.opusState}, ${b.advisorCalls} advisor calls; subagents: ${agents}; last verdict ${b.verdict?.status ?? 'none'}; shell ${b.shell.checked} checked, ${b.shell.blocked} blocked.`
+  const n = names(b)
+  const agents = v.shown.map(a => `${a.type || 'agent'} (${agentModel(a)}) ${a.status}`).join(', ') || 'no subagents'
+  return `Agent board: main session ${v.mainState} on ${n.main} (${n.mainNote}); advisor ${n.advisorText}, ${v.advisorState}, ${b.advisorCalls} advisor calls; reviewer ${v.reviewing ? 'reviewing' : 'idle'}; subagents: ${agents}; last verdict reported ${b.verdict?.status ?? 'none'}; shell ${b.shell.seen} seen, ${b.shell.blocked} blocked by a hook.`
 }

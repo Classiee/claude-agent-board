@@ -2,8 +2,11 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { AgentCard, Board, LogEntry, LogTone } from '../types'
-import { boardAlt, boardSvg, clock, view } from './board-svg'
+import { agentModel, boardAlt, boardSvg, clock, cut, names, view } from './board-svg'
 import { isCommitCommand } from './commit-scan'
+import { modelFamily } from './models'
+import { applyAgentModel, applyConfigured, applyMainModel, configuredFromSettings, finalVerdict, verdictOfInput } from './observe'
+import type { Configured } from './observe'
 
 export { isCommitCommand }
 
@@ -15,39 +18,23 @@ const MAX_LOG = 40
 const EMPTY: Board = {
   startedAt: 0,
   mainModel: '',
+  mainSource: 'configured',
   mainStatus: 'idle',
   mainTurnAt: 0,
   advisorCalls: 0,
   agents: [],
-  shell: { checked: 0, blocked: 0 },
+  shell: { seen: 0, blocked: 0 },
   log: [],
 }
 
 // Bump the tag when Board's fields change: a value an older version stored
 // outlives a reload and is then read as EMPTY instead.
 const board = atom({ plugin: 'agent-board', key: 'board' } as const, EMPTY, {
-  shape: 'board-2',
+  shape: 'board-3',
 })
 
-const VERDICT_RE = /VERDICT\s*:\s*[*_`]*\s*(APPROVED|REJECTED)\b/gi
-/** claude-haiku-5-5 -> "haiku 5.5"; aliases pass through. */
-export function shortModel(model: string | undefined): string {
-  if (!model) return '?'
-  const m = /claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(model)
-  if (!m) return model
-  return m[3] ? `${m[1]} ${m[2]}.${m[3]}` : `${m[1]} ${m[2]}`
-}
-
-export function lastVerdict(text: string): 'APPROVED' | 'REJECTED' | undefined {
-  let found: 'APPROVED' | 'REJECTED' | undefined
-  for (const m of text.matchAll(VERDICT_RE)) {
-    found = (m[1] ?? '').toUpperCase() === 'REJECTED' ? 'REJECTED' : 'APPROVED'
-  }
-  return found
-}
-
-function addLog(b: Board, at: number, who: string, text: string, tone: LogTone): Board {
-  const entry: LogEntry = { at, who, text, tone }
+function addLog(b: Board, at: number, who: string, text: string, tone: LogTone, family?: string): Board {
+  const entry: LogEntry = family ? { at, who, text, tone, family } : { at, who, text, tone }
   return { ...b, log: [...b.log, entry].slice(-MAX_LOG) }
 }
 
@@ -59,18 +46,41 @@ async function change($: Parameters<typeof read>[0], fn: (b: Board) => Board): P
   await update($, board, fn)
 }
 
+/** The models the user's settings and `/model` name. Whatever cannot be read stays unknown. */
+type ConfigSource = {
+  session: { model(): Promise<string> }
+  settings: { read(): Promise<Readonly<Record<string, unknown>>> }
+}
+async function readConfigured($: ConfigSource): Promise<Configured> {
+  const out: Configured = {}
+  try {
+    const m = await $.session.model()
+    if (typeof m === 'string' && m) out.main = m
+  } catch {
+    // not available here: the main model is learned from its responses instead
+  }
+  try {
+    Object.assign(out, configuredFromSettings(await $.settings.read()))
+  } catch {
+    // no settings to read this time: the board keeps what it knew
+    out.settingsUnread = true
+  }
+  return out
+}
+
 // Counted in memory and written only at moments that matter (an agent ends,
 // a call is blocked, a commit, the main turn ends), so a working subagent
-// never redraws the board and its animation runs uninterrupted.
+// never redraws the board from its tool calls and its animation runs uninterrupted
+// (it redraws once, when its first response shows which model ran).
 const pendingTools = new Map<string, number>()
-let pendingChecked = 0
-function takeChecked(): number {
-  const n = pendingChecked
-  pendingChecked = 0
+let pendingSeen = 0
+function takeSeen(): number {
+  const n = pendingSeen
+  pendingSeen = 0
   return n
 }
 
-// The verdict each skeptic put on the board in its current turn. A hand-back
+// The verdict each reviewer put on the board in its current turn. A hand-back
 // and the end of the same turn carry the same verdict, in either order: it is
 // logged once. A new turn or a new run starts afresh.
 const verdictShown = new Map<string, 'APPROVED' | 'REJECTED'>()
@@ -81,13 +91,17 @@ function patchAgent(b: Board, id: string, fn: (a: AgentCard) => AgentCard): Boar
 
 export const register: Register = (on, options) => {
   const openOnStart = options.openOnStart === true
+  const reviewerType = typeof options.reviewerAgent === 'string' && options.reviewerAgent.trim() ? options.reviewerAgent.trim() : 'skeptic'
 
   on('session.start', async ($, e, next) => {
     const now = await $.clock.now()
-    await update($, board, b => (b.startedAt ? b : addLog({ ...b, startedAt: now }, now, 'session', 'session start', 'info')))
+    const configured = await readConfigured($)
+    await update($, board, b =>
+      applyConfigured(b.startedAt ? b : addLog({ ...b, startedAt: now }, now, 'session', 'session start', 'info'), configured),
+    )
     await $.command.register({
       name: 'agent-board',
-      description: 'Open the agent board: main session, advisor, subagents, commit gate',
+      description: 'Open the agent board: main session, advisor, subagents, reviewer verdicts, shell calls',
     })
     if (openOnStart) void $.ui.open({ id: PANE, title: TITLE })
 
@@ -100,32 +114,44 @@ export const register: Register = (on, options) => {
     return { text: 'Agent board opened.' }
   })
 
-  // Main loop: thinking / idle, and when its turn began.
+  // Main loop: thinking / idle, and when its turn began. The configured models
+  // are read again here, so a changed setting shows without a restart.
   on('turn.start', async ($, e, next) => {
-    // a skeptic's new turn (resumed under its id) is a new review: its verdict is news
-    if (e.agentId !== undefined) verdictShown.delete(e.agentId)
-    if (e.agentId === undefined) {
+    if (e.agentId !== undefined) {
+      // an agent's new turn (resumed under its id) is a new review: its verdict is news
+      verdictShown.delete(e.agentId)
+    } else {
       const now = await $.clock.now()
-      await change($, b => ({ ...b, mainStatus: 'thinking', mainTurnAt: now }))
+      const configured = await readConfigured($)
+      await change($, b => applyConfigured({ ...b, mainStatus: 'thinking', mainTurnAt: now }, configured))
     }
     return next(e)
   })
 
-  // Each model request of the main loop: its model, and advisor consultations.
+  // Each model request: the model that answered is observed; the one the
+  // step asked for is only configured. Advisor consultations are counted.
   on('turn.step', async function* ($, e, next) {
     const res = yield* next(e)
-    if (e.agentId === undefined) {
-      const advisor = (res.serverToolUses ?? []).filter(u => u.name === 'advisor').length
-      const model = res.usage?.model ?? e.model
-      const now = await $.clock.now()
-      await change($, b => {
-        let nb: Board = b.mainModel === model ? b : { ...b, mainModel: model }
-        if (advisor > 0) {
-          nb = { ...nb, advisorCalls: b.advisorCalls + advisor, advisorLastAt: now }
-          nb = addLog(nb, now, 'opus', `advisor consulted (#${nb.advisorCalls})`, 'info')
-        }
-        return nb
-      })
+    // The model has already answered: nothing the board does from here may fail the step.
+    try {
+      const observed = res.usage?.model
+      if (e.agentId === undefined) {
+        const advisor = (res.serverToolUses ?? []).filter(u => u.name === 'advisor').length
+        const now = await $.clock.now()
+        await change($, b => {
+          let nb = applyMainModel(b, observed, e.model)
+          if (advisor > 0) {
+            nb = { ...nb, advisorCalls: b.advisorCalls + advisor, advisorLastAt: now }
+            nb = addLog(nb, now, 'advisor', `advisor consulted (#${nb.advisorCalls})`, 'info', modelFamily(nb.advisorModel))
+          }
+          return nb
+        })
+      } else if (observed) {
+        const id = e.agentId
+        await change($, b => applyAgentModel(b, id, observed))
+      }
+    } catch {
+      // a board failure must never stop a model step
     }
     return res
   })
@@ -133,39 +159,39 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const now = await $.clock.now()
     if (e.agentId === undefined) {
-      const checked = takeChecked()
+      const seen = takeSeen()
       await change($, b => ({
         ...b,
         mainStatus: 'idle',
-        shell: { ...b.shell, checked: b.shell.checked + checked },
+        shell: { ...b.shell, seen: b.shell.seen + seen },
       }))
       return next(e)
     }
     const id = e.agentId
     const failed = e.reason === 'error' || e.reason === 'refusal' || e.isAborted
-    const verdict = lastVerdict(e.answer)
+    const verdict = finalVerdict(e.answer)
     const tools = pendingTools.get(id) ?? 0
     pendingTools.delete(id)
-    const checked = takeChecked()
+    const seen = takeSeen()
     // Decide and mark in one step (no await between the check and the mark),
     // so a hand-back finishing meanwhile sees it; undo the mark if the board
     // write fails, so the verdict isn't lost.
-    const isSkeptic = (await read($, board)).agents.find(a => a.id === id)?.type === 'skeptic'
-    const freshVerdict = verdict !== undefined && isSkeptic && verdictShown.get(id) !== verdict ? verdict : undefined
+    const isReviewer = (await read($, board)).agents.find(a => a.id === id)?.reviewer === true
+    const freshVerdict = verdict !== undefined && isReviewer && verdictShown.get(id) !== verdict ? verdict : undefined
     if (freshVerdict) verdictShown.set(id, freshVerdict)
     try {
-    await update($, board, b => {
-      const card = b.agents.find(a => a.id === id)
-      if (!card) return b
-      let nb = patchAgent(b, id, a => ({ ...a, status: failed ? 'failed' : 'done', endedAt: now, tools: a.tools + tools }))
-      nb = { ...nb, shell: { ...nb.shell, checked: nb.shell.checked + checked } }
-      nb = addLog(nb, now, card.type, failed ? `stopped (${e.reason})` : `done in ${clock(now - card.startedAt)}`, failed ? 'bad' : 'ok')
-      if (freshVerdict) {
-        nb = { ...nb, verdict: { status: freshVerdict, at: now } }
-        nb = addLog(nb, now, 'skeptic', `VERDICT ${freshVerdict}`, freshVerdict === 'APPROVED' ? 'ok' : 'bad')
-      }
-      return nb
-    })
+      await update($, board, b => {
+        const card = b.agents.find(a => a.id === id)
+        if (!card) return b
+        let nb = patchAgent(b, id, a => ({ ...a, status: failed ? 'failed' : 'done', endedAt: now, tools: a.tools + tools }))
+        nb = { ...nb, shell: { ...nb.shell, seen: nb.shell.seen + seen } }
+        nb = addLog(nb, now, card.type, failed ? `stopped (${e.reason})` : `done in ${clock(now - card.startedAt)}`, failed ? 'bad' : 'ok', modelFamily(card.model))
+        if (freshVerdict) {
+          nb = { ...nb, verdict: { status: freshVerdict, at: now } }
+          nb = addLog(nb, now, card.type, `reported VERDICT ${freshVerdict}`, freshVerdict === 'APPROVED' ? 'ok' : 'bad', modelFamily(card.model))
+        }
+        return nb
+      })
     } catch (err) {
       if (freshVerdict && verdictShown.get(id) === freshVerdict) verdictShown.delete(id)
       throw err
@@ -181,7 +207,9 @@ export const register: Register = (on, options) => {
       const card: AgentCard = {
         id: res.agentId,
         type: e.subagentType,
-        model: shortModel(res.model),
+        model: res.model,
+        modelSource: 'configured', // what the spawn resolved; a response from the agent makes it observed
+        reviewer: e.subagentType === reviewerType,
         task: e.description,
         status: 'running',
         startedAt: now,
@@ -189,7 +217,7 @@ export const register: Register = (on, options) => {
       }
       await update($, board, b => {
         const nb = { ...b, agents: [...b.agents.filter(a => a.id !== card.id), card].slice(-MAX_AGENTS) }
-        return addLog(nb, now, 'sonnet', `delegate → ${card.type} (${card.model})`, 'info')
+        return addLog(nb, now, 'main', `delegate → ${card.type} · ${agentModel(card)}`, 'info', modelFamily(b.mainModel))
       })
     }
     return res
@@ -202,20 +230,20 @@ export const register: Register = (on, options) => {
     const res = await next(e)
     const now = await $.clock.now()
 
-    // A skeptic that hands its report back through a tool call carries its
-    // verdict there. Only that call counts: a grep or an edit that merely
-    // contains the words is not a verdict.
+    // A reviewer that hands its report back through a tool call carries its
+    // verdict there, as the last line of its text. Only that call counts: a
+    // grep or an edit that merely contains the words is not a verdict.
     // (the hand-back tool is not in the typed tool list, so compare as a string)
     const handedBack = !('isError' in res && res.isError) && !('deny' in res && res.deny)
     if (agentId !== undefined && (e.tool as string) === 'SubagentHandback' && handedBack) {
-      const verdict = lastVerdict(JSON.stringify(e))
+      const verdict = verdictOfInput(e)
       const card = (await read($, board)).agents.find(a => a.id === agentId)
-      if (verdict && card?.type === 'skeptic' && verdictShown.get(agentId) !== verdict) {
+      if (verdict && card?.reviewer && verdictShown.get(agentId) !== verdict) {
         verdictShown.set(agentId, verdict) // marked before the write; undone if it fails
         try {
           await update($, board, b => {
             const nb: Board = { ...b, verdict: { status: verdict, at: now } }
-            return addLog(nb, now, 'skeptic', `VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad')
+            return addLog(nb, now, card.type, `reported VERDICT ${verdict}`, verdict === 'APPROVED' ? 'ok' : 'bad', modelFamily(card.model))
           })
         } catch (err) {
           if (verdictShown.get(agentId) === verdict) verdictShown.delete(agentId)
@@ -230,26 +258,31 @@ export const register: Register = (on, options) => {
       const hookBlocked = /hook error|hook stopped|blocked/i.test(errText) && /PreToolUse|commit-gate/.test(errText)
       const gateBlocked = errText.includes('[commit-gate]')
       const isCommit = isCommitCommand(command)
-      pendingChecked++
-      const worthDrawing = (hookBlocked && !gateBlocked) || (isCommit && (gateBlocked || !errText))
+      pendingSeen++
+      const worthDrawing = (hookBlocked && !gateBlocked) || isCommit
       if (!worthDrawing) return res
-      const checked = takeChecked()
+      const seen = takeSeen()
       await update($, board, b => {
         let nb: Board = {
           ...b,
           shell: {
-            checked: b.shell.checked + checked,
+            seen: b.shell.seen + seen,
             blocked: b.shell.blocked + (hookBlocked && !gateBlocked ? 1 : 0),
           },
         }
-        const who = agentId === undefined ? 'sonnet' : b.agents.find(a => a.id === agentId)?.type ?? 'agent'
-        if (hookBlocked && !gateBlocked) nb = addLog(nb, now, 'haiku', `blocked a ${e.tool} call (${who})`, 'bad')
+        const who = agentId === undefined ? 'main' : b.agents.find(a => a.id === agentId)?.type ?? 'agent'
+        // Which hook refused is not known: only that a PreToolUse hook did.
+        if (hookBlocked && !gateBlocked) nb = addLog(nb, now, 'hook', `blocked a ${e.tool} call (${who})`, 'bad')
         if (isCommit && gateBlocked) {
+          const reason = /\[commit-gate\]\s*([^\n]*)/.exec(errText)?.[1]?.trim() ?? ''
           nb = { ...nb, commit: { outcome: 'blocked', at: now } }
-          nb = addLog(nb, now, 'gate', 'commit blocked: no approved verdict', 'bad')
+          nb = addLog(nb, now, 'commit', reason ? `commit blocked: ${cut(reason, 40)}` : 'commit blocked by the gate', 'bad')
         } else if (isCommit && !errText) {
-          nb = { ...nb, commit: { outcome: 'allowed', at: now } }
-          nb = addLog(nb, now, 'gate', 'commit allowed', 'ok')
+          // No error came back. That is all this shows: not that the commit succeeded.
+          nb = { ...nb, commit: { outcome: 'ran', at: now } }
+          nb = addLog(nb, now, 'commit', 'commit ran without error', 'ok')
+        } else if (isCommit) {
+          nb = addLog(nb, now, 'commit', `commit not completed: ${cut(errText.split('\n')[0] ?? '', 30)}`, 'bad')
         }
         return nb
       })
@@ -282,19 +315,22 @@ export const register: Register = (on, options) => {
     // The terminal has no Svg: a text tree with the same facts.
     const { Box, Text } = table
     const v = view(b, now)
+    const n = names(b)
     const t0 = b.startedAt || now
     const toneColor = (tone: LogTone) => (tone === 'ok' ? 'success' : tone === 'bad' ? 'error' : 'subtle')
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Text bold>CLAUDE CODE · 3 MODELS</Text>
+        <Text bold>CLAUDE CODE · AGENT BOARD</Text>
         <Text>
-          <Text color="claude" bold>
-            {shortModel(b.mainModel || 'claude-sonnet-5-5')}
+          <Text color={modelFamily(b.mainModel) ? 'claude' : undefined} bold>
+            {b.mainModel ? n.main : 'unknown model'}
           </Text>{' '}
-          main session · <Text color={v.mainState === 'idle' ? 'inactive' : 'claude'}>{v.mainState}</Text>
+          main session · <Text color={v.mainState === 'idle' ? 'inactive' : 'claude'}>{v.mainState}</Text>{' '}
+          <Text dimColor>({n.mainNote})</Text>
         </Text>
         <Text>
-          <Text color="suggestion">opus</Text> {v.opusState} · advisor calls {b.advisorCalls} · verdict{' '}
+          advisor {n.advisorText} {v.advisorState} · advisor calls {b.advisorCalls} · reviewer {v.reviewing ? 'reviewing' : 'idle'} ·
+          last verdict reported{' '}
           {b.verdict ? b.verdict.status.toLowerCase() : '—'}
         </Text>
         {v.shown.length === 0 && <Text dimColor>└╌ no subagents yet</Text>}
@@ -302,14 +338,14 @@ export const register: Register = (on, options) => {
           <Box key={a.id}>
             <Text>
               {i === v.shown.length - 1 ? '└╌ ' : '├╌ '}
-              <Text bold>{a.type}</Text> <Text dimColor>({a.model})</Text>{' '}
+              <Text bold>{a.type}</Text> <Text dimColor>({agentModel(a)})</Text>{' '}
               <Text color={a.status === 'running' ? 'claude' : a.status === 'done' ? 'success' : 'error'}>{a.status}</Text>{' '}
               <Text dimColor>· {a.tools} tools</Text>
             </Text>
           </Box>
         ))}
         <Text dimColor>
-          haiku shell check · {b.shell.checked} checked · {b.shell.blocked} blocked
+          shell calls {b.shell.seen} seen · {b.shell.blocked} blocked by a hook · model check: {n.shellText}
         </Text>
         <Text dimColor>SESSION LOG</Text>
         {b.log.slice(-6).map((l, i) => (
